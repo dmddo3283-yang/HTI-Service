@@ -339,11 +339,16 @@ async function preprocessHumming(buffer: AudioBuffer) {
   highpass.frequency.value = 70
   highpass.Q.value = 0.7
   lowpass.type = 'lowpass'
-  lowpass.frequency.value = 3200
+  // basic-pitch는 음정 판별에 기본음의 최대 7배음까지 사용한다(주석 음역 최고 ~4186Hz).
+  // 3200Hz로 자르면 중·고음 허밍의 상위 배음이 지워져 옥타브 오류·높은음 누락이 생긴다.
+  // 배음을 살리도록 컷오프를 높인다.
+  lowpass.frequency.value = 4800
   lowpass.Q.value = 0.55
-  compressor.threshold.value = -32
-  compressor.knee.value = 18
-  compressor.ratio.value = 3
+  // 압축을 다소 완만하게: 과한 압축은 배음 간 크기 비율을 왜곡해 모델을 헷갈리게 한다.
+  // 그래도 여린 음 꼬리는 어느 정도 들어 올린다.
+  compressor.threshold.value = -30
+  compressor.knee.value = 20
+  compressor.ratio.value = 2.5
   compressor.attack.value = 0.006
   compressor.release.value = 0.12
 
@@ -594,7 +599,7 @@ function App() {
       // onsetThresh·frameThresh를 낮춰 이어 부르거나 여린 음까지 잡고, 최소 음 길이(프레임)도
       // 줄여 짧은 음을 살린다. 음역대(minFreq/maxFreq)도 넓혀 높은 허밍을 놓치지 않는다.
       const detected = cleanHummingNotes(noteFramesToTime(
-        addPitchBendsToNoteEvents(contours, outputToNotesPoly(frames, onsets, 0.32, 0.22, 6, true, 1200, 65, true, 11)),
+        addPitchBendsToNoteEvents(contours, outputToNotesPoly(frames, onsets, 0.32, 0.20, 5, true, 1200, 65, true, 11)),
       ))
       // 편집을 위해 각 음에 id를 부여하고, '원본 복원'용으로 검출 결과를 보관한다.
       const withIds: EditableNote[] = detected.map((note) => ({ ...note, id: (noteIdRef.current += 1) }))
