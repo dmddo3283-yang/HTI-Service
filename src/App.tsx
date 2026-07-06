@@ -373,9 +373,10 @@ async function preprocessHumming(buffer: AudioBuffer) {
   const sortedRms = [...rmsValues].sort((a, b) => a - b)
   const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.2)] ?? 0
   const strongSignal = sortedRms[Math.floor(sortedRms.length * 0.9)] ?? 0
+  // 잡음이 검출로 새어 들어가지 않도록 게이트 문턱을 좀 더 높게 잡는다.
   const gateThreshold = Math.min(
-    strongSignal * 0.24,
-    Math.max(0.0012, noiseFloor * 2.1, strongSignal * 0.045),
+    strongSignal * 0.32,
+    Math.max(0.0018, noiseFloor * 3, strongSignal * 0.08),
   )
   const attack = 1 - Math.exp(-1 / (0.003 * 22050))
   // release를 늘려 음의 끝자락이 급하게 잘리지 않도록 한다. (음이 조각나는 것을 줄임)
@@ -385,9 +386,9 @@ async function preprocessHumming(buffer: AudioBuffer) {
 
   for (let index = 0; index < samples.length; index += 1) {
     const frameRms = rmsValues[Math.floor(index / frameSize)] ?? 0
-    // 게이트에 걸린 구간도 완전히 죽이지 않고 12%로만 낮춘다.
-    // 0.035로 두면 여린 음이나 음의 시작·끝이 모델에 닿기 전에 통째로 사라져 음을 놓친다.
-    const target = frameRms >= gateThreshold ? 1 : 0.12
+    // 게이트에 걸린 구간을 8%로 낮춰 음 사이 잡음을 더 눌러준다.
+    // (너무 낮추면 여린 음의 시작·끝까지 사라지므로 완전히 죽이지는 않는다.)
+    const target = frameRms >= gateThreshold ? 1 : 0.08
     envelope += (target - envelope) * (target > envelope ? attack : release)
     samples[index] *= envelope
     peak = Math.max(peak, Math.abs(samples[index]))
@@ -412,10 +413,10 @@ function cleanHummingNotes(rawNotes: NoteEventTime[]) {
   if (!rawNotes.length) return []
   const amplitudes = rawNotes.map((note) => note.amplitude).sort((a, b) => a - b)
   const medianAmplitude = amplitudes[Math.floor(amplitudes.length / 2)] ?? 0
-  // 여린 음을 살리기 위해 신뢰도 바닥값과 최소 길이를 낮춘다. (놓치는 음 감소)
-  const confidenceFloor = Math.max(0.1, medianAmplitude * 0.28)
+  // 잡음성 음을 걸러내기 위해 신뢰도 바닥값과 최소 길이를 높인다. (잡음 감소)
+  const confidenceFloor = Math.max(0.14, medianAmplitude * 0.38)
   const candidates = rawNotes
-    .filter((note) => note.durationSeconds >= 0.07 && note.amplitude >= confidenceFloor)
+    .filter((note) => note.durationSeconds >= 0.1 && note.amplitude >= confidenceFloor)
     .filter((note) => note.pitchMidi >= 33 && note.pitchMidi <= 96)
 
   // 허밍은 단선율이므로, 강한 기본음과 동시에 생긴 약한 배음(주로 옥타브)을 제거한다.
@@ -596,10 +597,10 @@ function App() {
         },
         (value) => setProgress(value),
       )
-      // onsetThresh·frameThresh를 낮춰 이어 부르거나 여린 음까지 잡고, 최소 음 길이(프레임)도
-      // 줄여 짧은 음을 살린다. 음역대(minFreq/maxFreq)도 넓혀 높은 허밍을 놓치지 않는다.
+      // onsetThresh·frameThresh를 올려 잡음이 만든 약한 검출을 배제하고, 최소 음 길이(프레임)도
+      // 늘려 짧은 잡음 조각을 걸러낸다. 음역대(minFreq/maxFreq)는 허밍 범위로 유지한다.
       const detected = cleanHummingNotes(noteFramesToTime(
-        addPitchBendsToNoteEvents(contours, outputToNotesPoly(frames, onsets, 0.32, 0.20, 5, true, 1200, 65, true, 11)),
+        addPitchBendsToNoteEvents(contours, outputToNotesPoly(frames, onsets, 0.37, 0.26, 8, true, 1200, 65, true, 11)),
       ))
       // 편집을 위해 각 음에 id를 부여하고, '원본 복원'용으로 검출 결과를 보관한다.
       const withIds: EditableNote[] = detected.map((note) => ({ ...note, id: (noteIdRef.current += 1) }))
