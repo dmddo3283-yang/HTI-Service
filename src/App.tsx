@@ -8,6 +8,8 @@ type AppState = 'idle' | 'recording' | 'recorded' | 'converting' | 'ready' | 'er
 type EditableNote = NoteEventTime & { id: number }
 
 const MAX_RECORDING_SECONDS = 30
+// 업로드 파일이 너무 길면 분석이 느려지므로 앞부분만 사용한다.
+const MAX_UPLOAD_SECONDS = 120
 const MODEL_URL = '/basic-pitch-model/model.json'
 
 const PITCH_MIN = 21
@@ -81,7 +83,7 @@ function snapPitchToScale(pitchMidi: number, root: number, steps: number[]) {
   return clampPitch(pitchMidi + bestOffset)
 }
 
-const Icon = ({ name, size = 20 }: { name: 'mic' | 'stop' | 'spark' | 'play' | 'pause' | 'download' | 'wave'; size?: number }) => {
+const Icon = ({ name, size = 20 }: { name: 'mic' | 'stop' | 'spark' | 'play' | 'pause' | 'download' | 'upload' | 'wave'; size?: number }) => {
   const paths = {
     mic: <><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4M8 22h8"/></>,
     stop: <rect x="6" y="6" width="12" height="12" rx="2"/>,
@@ -89,6 +91,7 @@ const Icon = ({ name, size = 20 }: { name: 'mic' | 'stop' | 'spark' | 'play' | '
     play: <path d="m8 5 11 7-11 7V5Z" fill="currentColor" stroke="none"/>,
     pause: <><path d="M8 5v14M16 5v14"/></>,
     download: <><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></>,
+    upload: <><path d="M12 20V8M8 12l4-4 4 4M5 4h14"/></>,
     wave: <path d="M3 12h2l2-7 3 14 3-11 2 8 2-4h4"/>,
   }
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
@@ -327,6 +330,17 @@ function PianoRoll({ notes, duration, position, editable = false, selectedId = n
   )
 }
 
+// 길이가 maxSeconds를 넘으면 앞부분만 잘라낸 버퍼를 만든다. (긴 업로드 파일 대비)
+function truncateBuffer(buffer: AudioBuffer, maxSeconds: number, context: BaseAudioContext) {
+  if (buffer.duration <= maxSeconds) return buffer
+  const frames = Math.floor(maxSeconds * buffer.sampleRate)
+  const out = context.createBuffer(buffer.numberOfChannels, frames, buffer.sampleRate)
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    out.copyToChannel(buffer.getChannelData(channel).subarray(0, frames), channel)
+  }
+  return out
+}
+
 async function preprocessHumming(buffer: AudioBuffer) {
   const length = Math.ceil(buffer.duration * 22050)
   const offline = new OfflineAudioContext(1, length, 22050)
@@ -488,6 +502,7 @@ function App() {
   const noteIdRef = useRef(0)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const recordingStartedRef = useRef(0)
@@ -806,6 +821,35 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
+  // MP3·MP4 등 오디오 파일을 받아 디코딩한 뒤, 녹음과 동일하게 recordedBuffer로 연결한다.
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = '' // 같은 파일을 다시 선택해도 onChange가 동작하도록 초기화
+    if (!file) return
+    stopPlayback(true)
+    setMessage(`'${file.name}' 파일을 읽고 있어요…`)
+    try {
+      const decodeContext = new AudioContext()
+      const decoded = await decodeContext.decodeAudioData(await file.arrayBuffer())
+      const buffer = truncateBuffer(decoded, MAX_UPLOAD_SECONDS, decodeContext)
+      await decodeContext.close()
+      setRecordedBuffer(buffer)
+      setNotes([])
+      setHistory([])
+      setSelectedId(null)
+      setOriginalNotes([])
+      setPosition(0)
+      setRecordingSeconds(0)
+      setProgress(0)
+      setAppState('recorded')
+      const wasTruncated = decoded.duration > MAX_UPLOAD_SECONDS
+      setMessage(`'${file.name}' (${formatTime(buffer.duration)})${wasTruncated ? ' — 긴 파일이라 앞 2분만 사용해요.' : ''} 불러왔어요. 이제 MIDI로 변환하세요.`)
+    } catch {
+      setAppState('error')
+      setMessage('오디오를 읽지 못했어요. MP3 또는 MP4(AAC) 파일인지 확인해 주세요.')
+    }
+  }
+
   const resetRecording = () => {
     stopPlayback(true)
     setRecordedBuffer(null)
@@ -856,12 +900,12 @@ function App() {
 
       <section className="recorder-card">
         <div className="card-topline">
-          <span>INPUT / MICROPHONE</span>
+          <span>INPUT / MIC · FILE</span>
           <span className={`status ${appState}`}><i /> {appState === 'recording' ? 'RECORDING' : appState === 'converting' ? 'ANALYZING' : appState === 'ready' ? 'MIDI READY' : 'READY'}</span>
         </div>
         <div className="meter-wrap">
           <LevelMeter analyser={analyser} active={appState === 'recording'} />
-          <div className="record-time">{formatTime(appState === 'recording' ? recordingSeconds : recordedBuffer?.duration ?? 0)} <small>/ 0:30</small></div>
+          <div className="record-time">{formatTime(appState === 'recording' ? recordingSeconds : recordedBuffer?.duration ?? 0)}{appState === 'recording' && <small> / 0:30</small>}</div>
         </div>
         <p className="recorder-message">{message}</p>
         <div className="action-row">
@@ -875,6 +919,12 @@ function App() {
           </button>
         </div>
         {appState === 'converting' && <div className="conversion-progress"><span style={{ width: `${Math.max(3, progress * 100)}%` }} /></div>}
+        <input ref={fileInputRef} type="file" accept="audio/*,video/mp4,.mp3,.mp4,.m4a" onChange={handleFileUpload} hidden />
+        {appState !== 'recording' && appState !== 'converting' && (
+          <button className="upload-button" onClick={() => fileInputRef.current?.click()}>
+            <Icon name="upload" size={14} /> MP3·MP4 파일 불러오기
+          </button>
+        )}
         {(appState === 'error' || appState === 'ready') && recordedBuffer && <button className="text-button" onClick={resetRecording}>처음부터 다시 시작</button>}
       </section>
 

@@ -58,6 +58,8 @@ main { width: min(1180px, calc(100% - 48px)); margin: 0 auto; min-height: 100vh;
 .conversion-progress { height: 2px; background: #2a2b2e; max-width: 650px; margin: 18px auto 0; overflow: hidden; }
 .conversion-progress span { display: block; background: var(--acid); height: 100%; transition: width .25s; box-shadow: 0 0 10px var(--acid); }
 .text-button { display: block; margin: 16px auto -5px; border: 0; background: transparent; color: #797a7e; font-size: 11px; text-decoration: underline; cursor: pointer; }
+.upload-button { display: flex; align-items: center; gap: 7px; margin: 16px auto 0; width: fit-content; border: 1px dashed #3a3b40; border-radius: 5px; padding: 9px 16px; background: transparent; color: #9a9b9e; font-size: 12px; font-weight: 600; cursor: pointer; transition: .18s ease; }
+.upload-button:hover { border-color: var(--acid); color: var(--acid); }
 
 .studio-section { padding: 112px 0 90px; }
 .studio-heading { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 26px; }
