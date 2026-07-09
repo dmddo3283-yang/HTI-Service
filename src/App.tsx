@@ -43,6 +43,29 @@ const OUTLIER_THRESHOLDS: { value: number; label: string }[] = [
   { value: 15, label: '±15반음' },
 ]
 
+const BASIC_PITCH_SAMPLE_RATE = 22050
+const BASIC_PITCH_FFT_HOP = 256
+const BASIC_PITCH_WINDOW_LENGTH_SECONDS = 2
+const BASIC_PITCH_MIDI_OFFSET = 21
+const BASIC_PITCH_FRAME_SECONDS = BASIC_PITCH_FFT_HOP / BASIC_PITCH_SAMPLE_RATE
+const BASIC_PITCH_WINDOW_OFFSET_SECONDS =
+  BASIC_PITCH_FRAME_SECONDS * (
+    Math.floor(BASIC_PITCH_SAMPLE_RATE / BASIC_PITCH_FFT_HOP) * BASIC_PITCH_WINDOW_LENGTH_SECONDS
+    - ((BASIC_PITCH_SAMPLE_RATE * BASIC_PITCH_WINDOW_LENGTH_SECONDS - BASIC_PITCH_FFT_HOP) / BASIC_PITCH_FFT_HOP)
+  ) + 0.0018
+
+// Basic Pitch 한 프레임은 약 11.6ms다. 5프레임 정도의 짧은 끊김만
+// 모델이 놓친 지속음으로 보고 잇는다.
+const SAME_PITCH_MERGE_MAX_GAP_SECONDS = 0.06
+const SAME_PITCH_ALWAYS_MERGE_GAP_SECONDS = BASIC_PITCH_FRAME_SECONDS * 1.5
+const SAME_PITCH_MERGE_MAX_OVERLAP_SECONDS = 0.03
+const BRIDGE_FRAME_SUPPORT_THRESHOLD = 0.12
+const BRIDGE_FRAME_SUPPORT_RATIO = 0.35
+const PROTECTED_REATTACK_MIN_GAP_SECONDS = 0.015
+const REATTACK_ONSET_THRESHOLD = 0.45
+const PRE_MERGE_MIN_DURATION_SECONDS = 0.035
+const FINAL_MIN_DURATION_SECONDS = 0.085
+
 const clampPitch = (pitch: number) => Math.min(PITCH_MAX, Math.max(PITCH_MIN, Math.round(pitch)))
 const sortByTime = (list: EditableNote[]) => [...list].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
 
@@ -423,59 +446,184 @@ function overlapRatio(a: NoteEventTime, b: NoteEventTime) {
   return Math.max(0, end - start) / Math.max(0.001, Math.min(a.durationSeconds, b.durationSeconds))
 }
 
-function cleanHummingNotes(rawNotes: NoteEventTime[]) {
-  if (!rawNotes.length) return []
-  const amplitudes = rawNotes.map((note) => note.amplitude).sort((a, b) => a - b)
-  const medianAmplitude = amplitudes[Math.floor(amplitudes.length / 2)] ?? 0
-  // 잡음성 음을 걸러내기 위해 신뢰도 바닥값과 최소 길이를 높인다. (잡음 감소)
-  const confidenceFloor = Math.max(0.14, medianAmplitude * 0.38)
-  const candidates = rawNotes
-    .filter((note) => note.durationSeconds >= 0.1 && note.amplitude >= confidenceFloor)
-    .filter((note) => note.pitchMidi >= 33 && note.pitchMidi <= 96)
+function noteEnd(note: NoteEventTime) {
+  return note.startTimeSeconds + note.durationSeconds
+}
 
-  // 허밍은 단선율이므로, 강한 기본음과 동시에 생긴 약한 배음(주로 옥타브)을 제거한다.
-  const withoutHarmonics = candidates.filter((note, index) => !candidates.some((other, otherIndex) => {
-    if (index === otherIndex || other.amplitude <= note.amplitude * 1.08) return false
-    const interval = Math.abs(other.pitchMidi - note.pitchMidi)
-    const looksLikeHarmonic = [12, 19, 24].some((harmonic) => Math.abs(interval - harmonic) <= 1)
-    return looksLikeHarmonic && overlapRatio(note, other) >= 0.62
-  }))
+function pitchFrameIndex(pitchMidi: number, matrix: number[][]) {
+  const pitchIndex = Math.round(pitchMidi) - BASIC_PITCH_MIDI_OFFSET
+  if (pitchIndex < 0 || pitchIndex >= (matrix[0]?.length ?? 0)) return null
+  return pitchIndex
+}
 
-  const stabilized = withoutHarmonics
-    .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
+function timeToBasicPitchFrame(timeSeconds: number) {
+  return Math.round((timeSeconds + BASIC_PITCH_WINDOW_OFFSET_SECONDS) / BASIC_PITCH_FRAME_SECONDS)
+}
+
+function onsetStrengthAtNoteStart(note: NoteEventTime, onsets: number[][]) {
+  if (!onsets.length) return 0
+  const pitchIndex = pitchFrameIndex(note.pitchMidi, onsets)
+  if (pitchIndex === null) return 0
+
+  const centerFrame = timeToBasicPitchFrame(note.startTimeSeconds)
+  let strength = 0
+  for (let frame = centerFrame - 1; frame <= centerFrame + 2; frame += 1) {
+    strength = Math.max(strength, onsets[frame]?.[pitchIndex] ?? 0)
+  }
+  return strength
+}
+
+function hasProtectedReattack(note: NoteEventTime, gap: number, onsets: number[][]) {
+  return gap >= PROTECTED_REATTACK_MIN_GAP_SECONDS
+    && onsetStrengthAtNoteStart(note, onsets) >= REATTACK_ONSET_THRESHOLD
+}
+
+function bridgeHasFrameSupport(candidate: NoteEventTime, note: NoteEventTime, gap: number, frames: number[][]) {
+  if (gap <= SAME_PITCH_ALWAYS_MERGE_GAP_SECONDS || !frames.length) return true
+  const pitchIndex = pitchFrameIndex(note.pitchMidi, frames)
+  if (pitchIndex === null) return true
+
+  const startFrame = Math.max(0, Math.floor((noteEnd(candidate) + BASIC_PITCH_WINDOW_OFFSET_SECONDS) / BASIC_PITCH_FRAME_SECONDS))
+  const endFrame = Math.min(frames.length - 1, Math.ceil((note.startTimeSeconds + BASIC_PITCH_WINDOW_OFFSET_SECONDS) / BASIC_PITCH_FRAME_SECONDS))
+  if (endFrame <= startFrame) return true
+
+  let supportedFrames = 0
+  let totalFrames = 0
+  let maxStrength = 0
+  let sumStrength = 0
+  for (let frame = startFrame; frame <= endFrame; frame += 1) {
+    const strength = frames[frame]?.[pitchIndex] ?? 0
+    maxStrength = Math.max(maxStrength, strength)
+    sumStrength += strength
+    totalFrames += 1
+    if (strength >= BRIDGE_FRAME_SUPPORT_THRESHOLD) supportedFrames += 1
+  }
+
+  const supportRatio = supportedFrames / Math.max(1, totalFrames)
+  const averageStrength = sumStrength / Math.max(1, totalFrames)
+  return supportRatio >= BRIDGE_FRAME_SUPPORT_RATIO
+    || averageStrength >= BRIDGE_FRAME_SUPPORT_THRESHOLD * 0.7
+    || maxStrength >= BRIDGE_FRAME_SUPPORT_THRESHOLD * 1.35
+}
+
+function isHarmonicInterval(a: NoteEventTime, b: NoteEventTime) {
+  const interval = Math.abs(a.pitchMidi - b.pitchMidi)
+  return [12, 19, 24].some((harmonic) => Math.abs(interval - harmonic) <= 1)
+}
+
+function isLikelyHarmonicArtifact(note: NoteEventTime, stronger: NoteEventTime) {
+  if (!isHarmonicInterval(note, stronger)) return false
+  if (stronger.amplitude < note.amplitude * 1.65) return false
+  if (overlapRatio(note, stronger) < 0.85) return false
+
+  const startsTogether = Math.abs(note.startTimeSeconds - stronger.startTimeSeconds) <= 0.025
+  const containedByStronger = note.startTimeSeconds >= stronger.startTimeSeconds - 0.02
+    && noteEnd(note) <= noteEnd(stronger) + 0.02
+  const tuckedInside = containedByStronger
+    && !startsTogether
+    && note.durationSeconds <= stronger.durationSeconds * 0.85
+  const overwhelmingSameStart = startsTogether
+    && stronger.amplitude >= note.amplitude * 2.25
+    && note.durationSeconds <= stronger.durationSeconds * 0.9
+
+  return tuckedInside || overwhelmingSameStart
+}
+
+function removeLikelyHarmonicArtifacts(notes: NoteEventTime[]) {
+  return notes.filter((note, index) => !notes.some((other, otherIndex) => (
+    index !== otherIndex
+    && other.amplitude > note.amplitude
+    && isLikelyHarmonicArtifact(note, other)
+  )))
+}
+
+function stabilizeOctaveOutliers(notes: NoteEventTime[]) {
+  const stabilized = notes
+    .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds || a.pitchMidi - b.pitchMidi)
     .map((note) => ({ ...note }))
 
-  // 앞뒤 음이 비슷한데 가운데만 한 옥타브 튄 경우를 배음 오류로 보고 교정한다.
+  // 단선율 허밍에서만 보이는 짧은 옥타브 튐을 교정한다. 폴리포닉 파일의 실제 화음은
+  // 시간상 겹치는 경우가 많으므로, 앞-현재-뒤가 거의 순차적으로 놓인 경우로 제한한다.
   for (let index = 1; index < stabilized.length - 1; index += 1) {
     const previous = stabilized[index - 1]
     const current = stabilized[index]
     const next = stabilized[index + 1]
-    if (Math.abs(previous.pitchMidi - next.pitchMidi) > 3 || current.durationSeconds > 0.65) continue
+    const previousEnd = noteEnd(previous)
+    const currentEnd = noteEnd(current)
+    const sequential = previousEnd <= current.startTimeSeconds + SAME_PITCH_MERGE_MAX_OVERLAP_SECONDS
+      && currentEnd <= next.startTimeSeconds + SAME_PITCH_MERGE_MAX_OVERLAP_SECONDS
+    const closeNeighbors = current.startTimeSeconds - previousEnd <= 0.12
+      && next.startTimeSeconds - currentEnd <= 0.12
+    if (!sequential || !closeNeighbors) continue
+    if (Math.abs(previous.pitchMidi - next.pitchMidi) > 3 || current.durationSeconds > 0.45) continue
+    if (current.amplitude > Math.max(previous.amplitude, next.amplitude) * 0.95) continue
+
     const neighborPitch = Math.round((previous.pitchMidi + next.pitchMidi) / 2)
     const difference = current.pitchMidi - neighborPitch
     const octaves = Math.round(difference / 12)
     if (octaves !== 0 && Math.abs(difference - octaves * 12) <= 1) current.pitchMidi -= octaves * 12
   }
 
+  return stabilized
+}
+
+function mergeAdjacentSamePitchNotes(notes: NoteEventTime[], onsets: number[][], frames: number[][]) {
   const merged: NoteEventTime[] = []
-  for (const note of stabilized) {
-    const previous = merged[merged.length - 1]
-    const previousEnd = previous ? previous.startTimeSeconds + previous.durationSeconds : 0
-    const smallPitchWobble = previous && Math.abs(previous.pitchMidi - note.pitchMidi) <= 1
-    // 병합 조건을 더 보수적으로: 아주 짧은 조각(<0.2s)이 거의 붙어 있을(≤0.06s) 때만 합쳐
-    // 실제로 반복되는 음을 하나로 뭉개지 않도록 한다.
-    const oneFragmentIsShort = previous && Math.min(previous.durationSeconds, note.durationSeconds) < 0.2
-    if (previous && smallPitchWobble && oneFragmentIsShort && note.startTimeSeconds - previousEnd <= 0.06) {
-      const noteEnd = note.startTimeSeconds + note.durationSeconds
-      if (note.amplitude > previous.amplitude) previous.pitchMidi = note.pitchMidi
-      previous.durationSeconds = Math.max(previousEnd, noteEnd) - previous.startTimeSeconds
-      previous.amplitude = Math.max(previous.amplitude, note.amplitude)
+  for (const note of notes) {
+    let bestMatch: NoteEventTime | null = null
+    let bestScore = Infinity
+
+    for (const candidate of merged) {
+      if (candidate.pitchMidi !== note.pitchMidi) continue
+      const gap = note.startTimeSeconds - noteEnd(candidate)
+      if (gap > SAME_PITCH_MERGE_MAX_GAP_SECONDS || gap < -SAME_PITCH_MERGE_MAX_OVERLAP_SECONDS) continue
+      if (hasProtectedReattack(note, gap, onsets)) continue
+      if (gap > 0 && !bridgeHasFrameSupport(candidate, note, gap, frames)) continue
+
+      const score = Math.abs(gap)
+      if (score < bestScore) {
+        bestMatch = candidate
+        bestScore = score
+      }
+    }
+
+    if (!bestMatch) {
+      merged.push({ ...note })
       continue
     }
-    merged.push(note)
+
+    const noteEndTime = note.startTimeSeconds + note.durationSeconds
+    const matchEnd = bestMatch.startTimeSeconds + bestMatch.durationSeconds
+    bestMatch.durationSeconds = Math.max(matchEnd, noteEndTime) - bestMatch.startTimeSeconds
+    bestMatch.amplitude = Math.max(bestMatch.amplitude, note.amplitude)
   }
 
   return merged
+}
+
+function shouldKeepCleanedNote(note: NoteEventTime, confidenceFloor: number) {
+  if (note.durationSeconds >= FINAL_MIN_DURATION_SECONDS && note.amplitude >= confidenceFloor) return true
+  if (note.durationSeconds >= 0.075 && note.amplitude >= confidenceFloor * 1.25) return true
+  if (note.durationSeconds >= 0.16 && note.amplitude >= confidenceFloor * 0.68) return true
+  return false
+}
+
+function cleanHummingNotes(rawNotes: NoteEventTime[], onsets: number[][] = [], frames: number[][] = []) {
+  if (!rawNotes.length) return []
+  const amplitudes = rawNotes.map((note) => note.amplitude).sort((a, b) => a - b)
+  const medianAmplitude = amplitudes[Math.floor(amplitudes.length / 2)] ?? 0
+  const confidenceFloor = Math.max(0.14, medianAmplitude * 0.38)
+  const preMergeConfidenceFloor = Math.max(0.035, confidenceFloor * 0.32)
+  const candidates = rawNotes
+    .filter((note) => note.durationSeconds >= PRE_MERGE_MIN_DURATION_SECONDS && note.amplitude >= preMergeConfidenceFloor)
+    .filter((note) => note.pitchMidi >= 33 && note.pitchMidi <= 96)
+
+  const stabilized = stabilizeOctaveOutliers(candidates)
+  const merged = mergeAdjacentSamePitchNotes(stabilized, onsets, frames)
+  const withoutHarmonics = removeLikelyHarmonicArtifacts(merged)
+  return withoutHarmonics
+    .filter((note) => shouldKeepCleanedNote(note, confidenceFloor))
+    .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds || a.pitchMidi - b.pitchMidi)
 }
 
 function App() {
@@ -612,11 +760,12 @@ function App() {
         },
         (value) => setProgress(value),
       )
-      // onsetThresh·frameThresh를 올려 잡음이 만든 약한 검출을 배제하고, 최소 음 길이(프레임)도
-      // 늘려 짧은 잡음 조각을 걸러낸다. 음역대(minFreq/maxFreq)는 허밍 범위로 유지한다.
+      // inferOnsets는 켜 두어 실제 재타격/반복음을 살리고, 후처리에서 raw onset이 약한
+      // 같은 pitch 조각만 병합한다. 이렇게 해야 지속음 쪼개짐을 줄이면서 원래 있던 음을
+      // 하나로 뭉개는 위험을 낮출 수 있다.
       const detected = cleanHummingNotes(noteFramesToTime(
         addPitchBendsToNoteEvents(contours, outputToNotesPoly(frames, onsets, 0.37, 0.26, 8, true, 1200, 65, true, 11)),
-      ))
+      ), onsets, frames)
       // 편집을 위해 각 음에 id를 부여하고, '원본 복원'용으로 검출 결과를 보관한다.
       const withIds: EditableNote[] = detected.map((note) => ({ ...note, id: (noteIdRef.current += 1) }))
       setOriginalNotes(withIds)
